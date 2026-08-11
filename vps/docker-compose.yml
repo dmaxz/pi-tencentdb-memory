@@ -1,0 +1,62 @@
+# MemoryCore standalone gateway + MemoryHub panel — the backend for the pi
+# tencentdb-memory extension.
+#
+# Usage:
+#   cp .env.example .env   # fill in your values
+#   docker compose up -d
+#
+# Memory-core (8420) = the API the pi extension calls. Memory-hub (8125 panel,
+# 8424 knowledge) = optional human-facing management UI.
+#
+# All published ports bind to ${TDAI_BIND_IP} when set — e.g. your NetBird mesh
+# IP (100.x.y.z) — so nothing is exposed on the public interface. Empty = all
+# interfaces.
+services:
+  memory-core:
+    image: agentmemory/memory-core:1.0.0   # pinned tag — avoid :latest for a memory service
+    container_name: tdai-memory-core
+    restart: unless-stopped
+    ports:
+      - "${TDAI_BIND_IP:-}:8420:8420"
+    volumes:
+      - tdai-memory-data:/data/tdai-memory          # persistent SQLite + files
+      - ./tdai-gateway.yaml:/data/config/tdai-gateway.yaml:ro
+    environment:
+      TDAI_GATEWAY_API_KEY: "${TDAI_GATEWAY_API_KEY:-}" # empty = auth off (not recommended on a VPS)
+      TDAI_LLM_BASE_URL: "${TDAI_LLM_BASE_URL:-}"
+      TDAI_LLM_API_KEY: "${TDAI_LLM_API_KEY:-}"
+      TDAI_LLM_MODEL: "${TDAI_LLM_MODEL:-}"
+      TDAI_DATA_DIR: "/data/tdai-memory"
+
+  memory-hub:
+    image: agentmemory/memory-hub:1.0.0    # pinned tag — panel + knowledge service
+    container_name: tdai-memory-hub
+    restart: unless-stopped
+    depends_on:
+      memory-core:
+        condition: service_healthy
+    ports:
+      - "${TDAI_BIND_IP:-}:8125:8125"      # Panel UI
+      - "${TDAI_BIND_IP:-}:8424:8424"      # Knowledge API
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - tdai-panel-data:/data/knowledge
+    environment:
+      PANEL_PORT: "8125"
+      KNOWLEDGE_PORT: "8424"
+      REMOTE_INSTANCE_ID: "default"
+      REMOTE_INSTANCE_NAME: "default"
+      REMOTE_INSTANCE_URL: "http://memory-core:8420"        # container-to-container on compose network
+      REMOTE_INSTANCE_KEY: "${TDAI_GATEWAY_API_KEY:-local}" # must match core's gate; see vps/README.md
+      KNOWLEDGE_PUBLIC_BASE_URL: "http://${TDAI_BIND_IP:-host.docker.internal}:8424/v3"
+      LLM_MODE: "custom"
+      LLM_PROTOCOL: "openai"
+      LLM_API_KEY: "${TDAI_LLM_API_KEY:-}"
+      LLM_BASE_URL: "${TDAI_LLM_BASE_URL:-}"
+      LLM_MODEL: "${TDAI_LLM_MODEL:-}"
+      KNOWLEDGE_LLM_BINDING_SYNC: "0"
+
+volumes:
+  tdai-memory-data:
+  tdai-panel-data:

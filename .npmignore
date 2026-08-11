@@ -1,0 +1,7 @@
+vps/
+.pi/
+node_modules/
+tsconfig.json
+_smoke/
+.git/
+.github/
