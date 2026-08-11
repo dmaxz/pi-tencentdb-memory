@@ -392,36 +392,34 @@ function chunkContent(filename: string, content: string, maxChars: number = WIKI
 
 /**
  * Archive a batch of turns to the wiki (raw source, auto-chunked, then ingest).
- * Never throws — failures are swallowed.
+ * Throws on failure so callers can restore the buffer / report errors. The
+ * initial read is best-effort (a missing file is a normal first write of the
+ * day); genuine errors surface at the write/ingest step.
  */
 async function flushWikiArchive(
   cfg: MemoryConfig,
   batch: Array<{ role: string; content: string }>,
 ): Promise<void> {
   if (!cfg.captureWikiId) return;
+  const date = new Date().toISOString().slice(0, 10);
+  const filename = `${cfg.captureWikiRef || "chat-archive"}-${date}.md`;
+  let content = renderWikiArchive(batch, cfg.sessionId);
   try {
-    const date = new Date().toISOString().slice(0, 10);
-    const filename = `${cfg.captureWikiRef || "chat-archive"}-${date}.md`;
-    let content = renderWikiArchive(batch, cfg.sessionId);
-    try {
-      const existing = await krequest<unknown>(cfg, "/wiki/raw/read", { wiki_id: cfg.captureWikiId, filenames: [filename] }, undefined);
-      const prior = asList(existing)[0] as Record<string, unknown> | undefined;
-      if (prior && typeof prior.content === "string" && prior.content) {
-        content = `${prior.content}\n${content}`;
-      }
-    } catch {
-      /* first write of the day */
+    const existing = await krequest<unknown>(cfg, "/wiki/raw/read", { wiki_id: cfg.captureWikiId, filenames: [filename] }, undefined);
+    const prior = asList(existing)[0] as Record<string, unknown> | undefined;
+    if (prior && typeof prior.content === "string" && prior.content) {
+      content = `${prior.content}\n${content}`;
     }
-    const files = chunkContent(filename, content, WIKI_CHUNK_MAX);
-    await krequest(cfg, "/wiki/raw/write", {
-      team_id: cfg.teamId,
-      wiki_id: cfg.captureWikiId,
-      files,
-    }, undefined);
-    await krequest(cfg, "/wiki/ingest", { wiki_id: cfg.captureWikiId }, undefined);
   } catch {
-    /* best-effort */
+    /* first write of the day */
   }
+  const files = chunkContent(filename, content, WIKI_CHUNK_MAX);
+  await krequest(cfg, "/wiki/raw/write", {
+    team_id: cfg.teamId,
+    wiki_id: cfg.captureWikiId,
+    files,
+  }, undefined);
+  await krequest(cfg, "/wiki/ingest", { wiki_id: cfg.captureWikiId }, undefined);
 }
 
 /** Re-sync the codegraph index. Never throws. */
@@ -1084,10 +1082,16 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
   // When captureEveryNTurns > 0, each completed turn is buffered and written
   // to L0 memory in batches of N (0 = off). Uses the same layered config as
   // the tools, so per-project agent/session/capture settings apply.
+  //
+  // Each turn is queued into TWO independent buffers: the chat buffer is
+  // drained by auto-capture and /tdmem-sync:chat-memory; the wiki buffer is
+  // drained only by /tdmem-sync:wiki-knowledge (manual). Splitting them keeps
+  // auto-capture from stealing turns that were meant for the wiki archive.
 
   let lastUserInput = "";
   let turnsSinceFlush = 0;
-  const pendingMessages: Array<{ role: "user" | "assistant" | "system"; content: string }> = [];
+  const pendingChatMessages: Array<{ role: "user" | "assistant" | "system"; content: string }> = [];
+  const pendingWikiMessages: Array<{ role: "user" | "assistant" | "system"; content: string }> = [];
 
   /** pi's message content is a string or an array of content blocks. */
   function extractText(content: unknown): string {
@@ -1154,17 +1158,17 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
 
   /** Write the buffered turns to L0 chat memory; keep on failure for the next retry. */
   async function flushCapturedMessages(ctx: ExtensionContext): Promise<void> {
-    if (pendingMessages.length === 0) return;
+    if (pendingChatMessages.length === 0) return;
     const cfg = loadConfig(ctx.cwd);
     if (!cfg.sessionId) return;
-    const batch = pendingMessages.splice(0);
+    const batch = pendingChatMessages.splice(0);
     try {
       await request(cfg, "POST", "/v3/conversation/add", isoBody(cfg, {
         session_id: cfg.sessionId,
         messages: batch,
       }), ctx.signal);
     } catch {
-      pendingMessages.unshift(...batch);
+      pendingChatMessages.unshift(...batch);
     }
   }
 
@@ -1176,9 +1180,17 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
     try {
       const n = loadConfig(ctx.cwd).captureEveryNTurns;
       const assistant = extractText((event.message as unknown as { content?: unknown }).content);
-      if (lastUserInput.trim()) pendingMessages.push({ role: "user", content: lastUserInput.trim() });
+      if (lastUserInput.trim()) {
+        const userMsg = { role: "user" as const, content: lastUserInput.trim() };
+        pendingChatMessages.push(userMsg);
+        pendingWikiMessages.push(userMsg);
+      }
       lastUserInput = "";
-      if (assistant.trim()) pendingMessages.push({ role: "assistant", content: assistant });
+      if (assistant.trim()) {
+        const assistantMsg = { role: "assistant" as const, content: assistant };
+        pendingChatMessages.push(assistantMsg);
+        pendingWikiMessages.push(assistantMsg);
+      }
       // Auto-flush to L0 only when N > 0; manual /tdmem-sync:* commands use the buffer regardless.
       if (n > 0) {
         turnsSinceFlush += 1;
@@ -1192,11 +1204,25 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
     }
   });
 
+  /** Drain the wiki buffer to the wiki archive on shutdown (best-effort, logged). */
+  async function flushPendingWikiArchive(ctx: ExtensionContext): Promise<void> {
+    if (pendingWikiMessages.length === 0) return;
+    const cfg = loadConfig(ctx.cwd);
+    if (!cfg.captureWikiId) return;
+    const batch = pendingWikiMessages.splice(0);
+    await flushWikiArchive(cfg, batch);
+  }
+
   pi.on("session_shutdown", async (_event, ctx) => {
     try {
-      await flushCapturedMessages(ctx); // flush any leftover partial batch
-    } catch {
-      /* best effort */
+      await flushCapturedMessages(ctx); // flush any leftover partial chat batch
+    } catch (err) {
+      console.error(`[tdmem] chat-memory shutdown flush failed: ${err instanceof Error ? err.message : err}`);
+    }
+    try {
+      await flushPendingWikiArchive(ctx); // flush leftover wiki turns too
+    } catch (err) {
+      console.error(`[tdmem] wiki shutdown flush failed: ${err instanceof Error ? err.message : err}`);
     }
   });
 
@@ -1214,7 +1240,7 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
           ctx.ui.notify("No session messages to sync.", "info");
           return;
         }
-        pendingMessages.splice(0);
+        pendingChatMessages.splice(0);
         turnsSinceFlush = 0;
         const cfg = loadConfig(ctx.cwd);
         if (!cfg.sessionId) {
@@ -1228,7 +1254,7 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
         ctx.ui.notify(`Synced ${messages.length} message(s) from session to chat memory.`, "info");
         return;
       }
-      const count = pendingMessages.length;
+      const count = pendingChatMessages.length;
       if (count === 0) {
         ctx.ui.notify("No pending turns to sync.", "info");
         return;
@@ -1255,7 +1281,7 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
           ctx.ui.notify("No session messages to archive.", "info");
           return;
         }
-        pendingMessages.splice(0);
+        pendingWikiMessages.splice(0);
         try {
           await flushWikiArchive(cfg, messages);
           ctx.ui.notify(`Archived ${messages.length} message(s) to wiki (${cfg.captureWikiId}).`, "info");
@@ -1264,18 +1290,21 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
         }
         return;
       }
-      const count = pendingMessages.length;
+      const count = pendingWikiMessages.length;
       if (count === 0) {
         ctx.ui.notify("No pending turns to sync.", "info");
         return;
       }
-      const batch = pendingMessages.splice(0);
+      const batch = pendingWikiMessages.splice(0);
       try {
         await flushWikiArchive(cfg, batch);
         ctx.ui.notify(`Archived ${count} turn(s) to wiki (${cfg.captureWikiId}).`, "info");
-      } catch {
-        pendingMessages.unshift(...batch);
-        ctx.ui.notify("Wiki sync failed — turns restored to buffer.", "error");
+      } catch (err) {
+        pendingWikiMessages.unshift(...batch);
+        ctx.ui.notify(
+          `Wiki sync failed — turns restored to buffer. ${err instanceof Error ? err.message : err}`,
+          "error",
+        );
       }
     },
   });
