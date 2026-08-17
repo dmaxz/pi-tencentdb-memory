@@ -62,6 +62,8 @@ interface MemoryConfig {
   sessionId: string;
   /** Auto-capture cadence: write a batch of turns to L0 every N turns. 0 = off. */
   captureEveryNTurns: number;
+  /** Auto-capture wiki cadence: summarize & archive turns to wiki every N turns. 0 = off. */
+  captureWikiEveryNTurns: number;
   /** Knowledge service base URL (wiki/codegraph; memory-hub :8424). */
   knowledgeEndpoint: string;
   /** Wiki id to archive captured turns to (empty = off). */
@@ -81,6 +83,7 @@ const DEFAULTS: MemoryConfig = {
   userId: "local",
   sessionId: "pi-session",
   captureEveryNTurns: 0, // off by default — auto-capture costs LLM extraction tokens
+  captureWikiEveryNTurns: 0, // off by default — auto-capture wiki every N turns
   knowledgeEndpoint: "http://127.0.0.1:8424/v3",
   captureWikiId: "",
   captureWikiRef: "chat-archive",
@@ -124,6 +127,9 @@ function sanitizeConfig(parsed: unknown): Partial<MemoryConfig> {
   const n = record["captureEveryNTurns"];
   if (typeof n === "number" && Number.isInteger(n) && n >= 0) out.captureEveryNTurns = n;
   else if (typeof n === "string" && /^\d+$/.test(n)) out.captureEveryNTurns = Number(n);
+  const wn = record["captureWikiEveryNTurns"];
+  if (typeof wn === "number" && Number.isInteger(wn) && wn >= 0) out.captureWikiEveryNTurns = wn;
+  else if (typeof wn === "string" && /^\d+$/.test(wn)) out.captureWikiEveryNTurns = Number(wn);
 
   return out;
 }
@@ -142,6 +148,10 @@ function loadConfig(cwd: string): MemoryConfig {
   if (env.TD_MEMORY_CAPTURE_N !== undefined && env.TD_MEMORY_CAPTURE_N !== "") {
     const n = Number(env.TD_MEMORY_CAPTURE_N);
     if (Number.isInteger(n) && n >= 0) fromEnv.captureEveryNTurns = n;
+  }
+  if (env.TD_MEMORY_CAPTURE_WIKI_N !== undefined && env.TD_MEMORY_CAPTURE_WIKI_N !== "") {
+    const n = Number(env.TD_MEMORY_CAPTURE_WIKI_N);
+    if (Number.isInteger(n) && n >= 0) fromEnv.captureWikiEveryNTurns = n;
   }
   if (env.TD_KNOWLEDGE_ENDPOINT) fromEnv.knowledgeEndpoint = env.TD_KNOWLEDGE_ENDPOINT;
   if (env.TD_MEMORY_CAPTURE_WIKI_ID) fromEnv.captureWikiId = env.TD_MEMORY_CAPTURE_WIKI_ID;
@@ -357,69 +367,234 @@ function renderWikiArchive(messages: Array<{ role: string; content: string }>, s
 }
 
 /**
- * Max chars per raw wiki source chunk.
- * The default VPS LLM (deepseek-v4-flash-free) abandons the ingest FILE-block
- * protocol on sources > ~1.5 KB — smaller chunks keep ingests reliable.
+ * Max chars per raw wiki source chunk / local session file (8,000 chars ~ 8 KB).
  */
-const WIKI_CHUNK_MAX = 1400;
+const WIKI_CHUNK_MAX = 8000;
 
 /**
- * Split long content into ≤maxChars chunks on paragraph boundaries so ingest
- * stays reliable. Each chunk becomes its own raw file (`<base>.part-N.md`).
+ * Split long content into ≤maxChars chunks so ingest stays reliable. Each chunk
+ * becomes its own raw file (`<base>.part-N.md`). Prefers paragraph breaks, then
+ * line breaks, then hard cuts — mirrors chunkMessage so a giant single-paragraph
+ * blob (e.g. a bullet-list archive with no blank lines) can never exceed maxChars.
  */
 function chunkContent(filename: string, content: string, maxChars: number = WIKI_CHUNK_MAX): Array<{ filename: string; content: string }> {
   if (content.length <= maxChars) return [{ filename, content }];
   const dot = filename.lastIndexOf(".");
   const base = dot > 0 ? filename.slice(0, dot) : filename;
   const ext = dot > 0 ? filename.slice(dot) : ".md";
-  const paragraphs = content.split(/\n{2,}/);
   const chunks: Array<{ filename: string; content: string }> = [];
-  let buf = "";
+  let remaining = content;
   let idx = 1;
-  const push = () => {
-    if (!buf.trim()) return;
-    chunks.push({ filename: `${base}.part-${idx}${ext}`, content: buf.trim() });
-    buf = "";
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    chunks.push({ filename: `${base}.part-${idx}${ext}`, content: t });
     idx += 1;
   };
-  for (const p of paragraphs) {
-    if ((buf + "\n\n" + p).length > maxChars) push();
-    buf = buf ? `${buf}\n\n${p}` : p;
+  while (remaining.length > maxChars) {
+    // Last paragraph break within the limit, then a line break, then hard cut.
+    let split = remaining.lastIndexOf("\n\n", maxChars);
+    if (split <= 0) split = remaining.lastIndexOf("\n", maxChars);
+    if (split <= 0) split = maxChars;
+    push(remaining.slice(0, split));
+    remaining = remaining.slice(split).replace(/^\n+/, "");
   }
-  push();
+  if (remaining.trim()) push(remaining);
   return chunks;
 }
 
 /**
- * Archive a batch of turns to the wiki (raw source, auto-chunked, then ingest).
- * Throws on failure so callers can restore the buffer / report errors. The
- * initial read is best-effort (a missing file is a normal first write of the
- * day); genuine errors surface at the write/ingest step.
+ * Summarize raw turn content using an LLM endpoint (if available) to extract only
+ * essential, durable technical information (decisions, requirements, designs, fixes).
+ * Falls back to structured markdown if no LLM endpoint is configured or call fails.
  */
-async function flushWikiArchive(
+async function cleanSummaryWithLLM(
+  cfg: MemoryConfig,
+  batch: Array<{ role: string; content: string }>,
+): Promise<string> {
+  const rawMarkdown = renderWikiArchive(batch, cfg.sessionId);
+
+  const env = process.env;
+  const llmBaseUrl = env.TD_MEMORY_LLM_BASE_URL || env.TDAI_LLM_BASE_URL || env.OPENAI_BASE_URL;
+  const llmApiKey = env.TD_MEMORY_LLM_API_KEY || env.TDAI_LLM_API_KEY || env.OPENAI_API_KEY || cfg.apiKey;
+  const llmModel = env.TD_MEMORY_LLM_MODEL || env.TDAI_LLM_MODEL || env.OPENAI_MODEL || "dahono/deepseek-v4-flash";
+
+  if (!llmBaseUrl) {
+    return rawMarkdown;
+  }
+
+  try {
+    const url = `${llmBaseUrl.replace(/\/+$/, "")}/chat/completions`;
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (llmApiKey) headers["Authorization"] = `Bearer ${llmApiKey}`;
+
+    const systemPrompt = `You are an expert AI technical writer.
+Summarize the provided chat turn(s) into concise, high-value Markdown bullet points.
+Extract ONLY durable technical decisions, architecture & database designs, requirements, bug fixes, key code changes, and progress.
+Omit conversational filler, casual chatter, and transient debugging outputs.
+Return ONLY clean Markdown content without surrounding explanation or backtick markdown fences.`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: llmModel,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: rawMarkdown },
+        ],
+        stream: false,
+      }),
+    });
+
+    if (res.ok) {
+      const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+      const text = data.choices?.[0]?.message?.content?.trim();
+      if (text) {
+        return text.replace(/^```(?:markdown)?\n?/, "").replace(/\n?```$/, "").trim();
+      }
+    }
+  } catch (err) {
+    console.error(`[tdmem] LLM summary cleanup failed, using raw: ${err instanceof Error ? err.message : err}`);
+  }
+
+  return rawMarkdown;
+}
+
+/**
+ * Ensure ~/.pi/tdmem-wikidb exists and return its directory path.
+ */
+function getWikiDbDir(): string {
+  const dir = path.join(os.homedir(), ".pi", "tdmem-wikidb");
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
+
+/**
+ * Archive turn batch to local session file (~/.pi/tdmem-wikidb/<baseName>.md or -2.md)
+ * using LLM cleanup, then upload and ingest to TencentDB Agent Memory Wiki.
+ */
+async function flushWikiArchiveSession(
   cfg: MemoryConfig,
   batch: Array<{ role: string; content: string }>,
 ): Promise<void> {
-  if (!cfg.captureWikiId) return;
+  if (!cfg.captureWikiId || batch.length === 0) return;
+
+  const cleanedText = await cleanSummaryWithLLM(cfg, batch);
+  if (!cleanedText.trim()) return;
+
+  const localDir = getWikiDbDir();
   const date = new Date().toISOString().slice(0, 10);
-  const filename = `${cfg.captureWikiRef || "chat-archive"}-${date}.md`;
-  let content = renderWikiArchive(batch, cfg.sessionId);
+  const refPrefix = cfg.captureWikiRef || "chat-archive";
+  const baseName = `${refPrefix}-${date}-session-${cfg.sessionId}`;
+
+  // Find all existing session files in ~/.pi/tdmem-wikidb/ matching baseName
+  // baseName.md (idx 1), baseName-2.md (idx 2), baseName-3.md (idx 3)...
+  let highestIdx = 1;
   try {
-    const existing = await krequest<unknown>(cfg, "/wiki/raw/read", { wiki_id: cfg.captureWikiId, filenames: [filename] }, undefined);
-    const prior = asList(existing)[0] as Record<string, unknown> | undefined;
-    if (prior && typeof prior.content === "string" && prior.content) {
-      content = `${prior.content}\n${content}`;
+    const files = fs.readdirSync(localDir);
+    const escapedBase = baseName.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&");
+    const regex = new RegExp(`^${escapedBase}(?:-(\\d+))?\\.md$`);
+    for (const f of files) {
+      const m = f.match(regex);
+      if (m) {
+        const idx = m[1] ? parseInt(m[1], 10) : 1;
+        if (idx > highestIdx) highestIdx = idx;
+      }
     }
   } catch {
-    /* first write of the day */
+    /* fallback to index 1 */
   }
-  const files = chunkContent(filename, content, WIKI_CHUNK_MAX);
+
+  const currentFilename = highestIdx === 1 ? `${baseName}.md` : `${baseName}-${highestIdx}.md`;
+  const currentFilePath = path.join(localDir, currentFilename);
+
+  let existingContent = "";
+  if (fs.existsSync(currentFilePath)) {
+    try {
+      existingContent = fs.readFileSync(currentFilePath, "utf8");
+    } catch {
+      existingContent = "";
+    }
+  }
+
+  let finalFilename = currentFilename;
+  let finalContent = "";
+
+  // Check if appending cleanedText exceeds WIKI_CHUNK_MAX (8000 chars)
+  if (existingContent.length > 0 && existingContent.length + 2 + cleanedText.length > WIKI_CHUNK_MAX) {
+    // Exceeds max file size — overflow to next suffix index (-2.md, -3.md...)
+    highestIdx += 1;
+    finalFilename = `${baseName}-${highestIdx}.md`;
+    const newFilePath = path.join(localDir, finalFilename);
+    finalContent = cleanedText;
+    fs.writeFileSync(newFilePath, finalContent, "utf8");
+  } else {
+    // Append to current session file
+    finalContent = existingContent ? `${existingContent}\n\n${cleanedText}` : cleanedText;
+    fs.writeFileSync(currentFilePath, finalContent, "utf8");
+  }
+
+  // Upload the updated/created file to TencentDB Agent Memory Wiki and trigger ingest
   await krequest(cfg, "/wiki/raw/write", {
     team_id: cfg.teamId,
     wiki_id: cfg.captureWikiId,
-    files,
+    files: [{ filename: finalFilename, content: finalContent }],
   }, undefined);
+
   await krequest(cfg, "/wiki/ingest", { wiki_id: cfg.captureWikiId }, undefined);
+}
+
+/** Legacy alias for backward compatibility */
+const flushWikiArchive = flushWikiArchiveSession;
+
+/**
+ * Cancel an in-flight background wiki ingest by deleting the processing wiki
+ * asset and creating a fresh wiki with the same name. Updates cfg.captureWikiId
+ * and persists the updated config to disk.
+ */
+async function cancelAndRecreateWiki(cfg: MemoryConfig, cwd: string): Promise<string> {
+  const oldWikiId = cfg.captureWikiId;
+  let wikiName = cfg.captureWikiRef || "chat-archive";
+
+  try {
+    const detail = await krequest<{ name?: string }>(cfg, "/wiki/get", { wiki_id: oldWikiId }, undefined);
+    if (detail && detail.name) {
+      wikiName = detail.name;
+    }
+  } catch {
+    /* fallback to default name */
+  }
+
+  // Delete existing processing wiki (notifies background worker to abort)
+  try {
+    await krequest(cfg, "/wiki/delete", { wiki_ids: [oldWikiId] }, undefined);
+  } catch {
+    /* best-effort delete */
+  }
+
+  // Create a new fresh wiki
+  const created = await krequest<{ wiki_id?: string }>(cfg, "/wiki/create", { team_id: cfg.teamId, name: wikiName }, undefined);
+  const newWikiId = created.wiki_id;
+  if (!newWikiId) {
+    throw new Error("Failed to recreate wiki after cancellation: server returned no wiki_id");
+  }
+
+  cfg.captureWikiId = newWikiId;
+  try {
+    const pPath = projectConfigPath(cwd);
+    if (fs.existsSync(pPath)) {
+      saveProjectConfig(cwd, { captureWikiId: newWikiId });
+    } else {
+      saveConfig(cwd, cfg);
+    }
+  } catch {
+    /* best-effort config save */
+  }
+
+  return newWikiId;
 }
 
 /** Re-sync the codegraph index. Never throws. */
@@ -934,11 +1109,16 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
       const cfg = loadConfig(ctx.cwd);
       try {
         const chunks = chunkContent(params.filename, params.content, params.max_chunk_chars ?? WIKI_CHUNK_MAX);
-        const data = await krequest<unknown>(cfg, "/wiki/raw/write", {
-          team_id: cfg.teamId,
-          wiki_id: params.wiki_id,
-          files: chunks,
-        }, signal);
+        // The hub rejects raw/write with more than 10 files per call — batch them.
+        const WRITE_BATCH = 10;
+        let data: unknown;
+        for (let i = 0; i < chunks.length; i += WRITE_BATCH) {
+          data = await krequest<unknown>(cfg, "/wiki/raw/write", {
+            team_id: cfg.teamId,
+            wiki_id: params.wiki_id,
+            files: chunks.slice(i, i + WRITE_BATCH),
+          }, signal);
+        }
         await krequest<unknown>(cfg, "/wiki/ingest", { wiki_id: params.wiki_id }, signal);
         const split = chunks.length > 1 ? ` (split into ${chunks.length} chunks)` : "";
         return textResult(`Source uploaded${split} + ingest triggered: ${JSON.stringify(data)}`);
@@ -1090,6 +1270,7 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
 
   let lastUserInput = "";
   let turnsSinceFlush = 0;
+  let wikiTurnsSinceFlush = 0;
   const pendingChatMessages: Array<{ role: "user" | "assistant" | "system"; content: string }> = [];
   const pendingWikiMessages: Array<{ role: "user" | "assistant" | "system"; content: string }> = [];
 
@@ -1178,7 +1359,8 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
 
   pi.on("turn_end", async (event, ctx) => {
     try {
-      const n = loadConfig(ctx.cwd).captureEveryNTurns;
+      const cfg = loadConfig(ctx.cwd);
+      const n = cfg.captureEveryNTurns;
       const assistant = extractText((event.message as unknown as { content?: unknown }).content);
       if (lastUserInput.trim()) {
         const userMsg = { role: "user" as const, content: lastUserInput.trim() };
@@ -1197,6 +1379,17 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
         if (turnsSinceFlush >= n) {
           turnsSinceFlush = 0;
           await flushCapturedMessages(ctx);
+        }
+      }
+      const wikiN = cfg.captureWikiEveryNTurns;
+      if (wikiN > 0 && cfg.captureWikiId) {
+        wikiTurnsSinceFlush += 1;
+        if (wikiTurnsSinceFlush >= wikiN) {
+          wikiTurnsSinceFlush = 0;
+          const wikiBatch = pendingWikiMessages.splice(0);
+          flushWikiArchiveSession(cfg, wikiBatch).catch((err) => {
+            console.error(`[tdmem] async wiki capture failed: ${err instanceof Error ? err.message : err}`);
+          });
         }
       }
     } catch {
@@ -1275,31 +1468,105 @@ export default function tencentdbMemoryExtension(pi: ExtensionAPI) {
         ctx.ui.notify("No wiki ID configured. Set captureWikiId via /tdmem config or /tdmem config-local.", "error");
         return;
       }
-      if (args.trim().toLowerCase() === "all") {
-        const messages = getSessionMessages(ctx);
-        if (messages.length === 0) {
-          ctx.ui.notify("No session messages to archive.", "info");
+
+      const isAll = args.trim().toLowerCase() === "all";
+      const messages = isAll ? getSessionMessages(ctx) : pendingWikiMessages;
+      if (messages.length === 0) {
+        ctx.ui.notify(isAll ? "No session messages to archive." : "No pending turns to sync.", "info");
+        return;
+      }
+
+      // Check if the wiki is currently processing before attempting write
+      let isProcessing = false;
+      try {
+        const detail = await krequest<{ status?: string }>(cfg, "/wiki/get", { wiki_id: cfg.captureWikiId }, undefined);
+        if (detail && (detail.status === "processing" || detail.status === "pending")) {
+          isProcessing = true;
+        }
+      } catch {
+        /* best effort check */
+      }
+
+      if (isProcessing) {
+        let confirmCancel = false;
+        if (ctx.hasUI) {
+          confirmCancel = await ctx.ui.confirm(
+            "Wiki is Processing",
+            `Wiki "${cfg.captureWikiId}" is currently processing a background ingest task.\nDo you want to cancel the processing and force re-upload?`,
+          );
+        }
+
+        if (!confirmCancel) {
+          ctx.ui.notify("Wiki sync cancelled. Wiki remains in processing status.", "info");
           return;
         }
+
+        // User confirmed YES -> cancel processing (delete & recreate wiki)
+        try {
+          ctx.ui.notify(`Cancelling background ingest for wiki ${cfg.captureWikiId}...`, "info");
+          const newId = await cancelAndRecreateWiki(cfg, ctx.cwd);
+          ctx.ui.notify(`Background ingest cancelled. New wiki created: ${newId}`, "info");
+        } catch (err) {
+          ctx.ui.notify(`Failed to cancel processing: ${err instanceof Error ? err.message : err}`, "error");
+          return;
+        }
+      }
+
+      // Perform archive
+      if (isAll) {
         pendingWikiMessages.splice(0);
         try {
-          await flushWikiArchive(cfg, messages);
+          await flushWikiArchiveSession(cfg, messages);
           ctx.ui.notify(`Archived ${messages.length} message(s) to wiki (${cfg.captureWikiId}).`, "info");
         } catch (err) {
+          const errStr = String(err);
+          if (/processing/i.test(errStr) && ctx.hasUI) {
+            const confirm = await ctx.ui.confirm(
+              "Wiki is Processing",
+              `Wiki "${cfg.captureWikiId}" is currently processing.\nDo you want to cancel the processing and retry upload?`,
+            );
+            if (confirm) {
+              try {
+                const newId = await cancelAndRecreateWiki(cfg, ctx.cwd);
+                await flushWikiArchiveSession(cfg, messages);
+                ctx.ui.notify(`Archived ${messages.length} message(s) to new wiki (${newId}).`, "info");
+                return;
+              } catch (reErr) {
+                ctx.ui.notify(`Wiki archive failed: ${reErr instanceof Error ? reErr.message : reErr}`, "error");
+                return;
+              }
+            }
+          }
           ctx.ui.notify(`Wiki archive failed: ${err instanceof Error ? err.message : err}`, "error");
         }
         return;
       }
+
       const count = pendingWikiMessages.length;
-      if (count === 0) {
-        ctx.ui.notify("No pending turns to sync.", "info");
-        return;
-      }
       const batch = pendingWikiMessages.splice(0);
       try {
-        await flushWikiArchive(cfg, batch);
+        await flushWikiArchiveSession(cfg, batch);
         ctx.ui.notify(`Archived ${count} turn(s) to wiki (${cfg.captureWikiId}).`, "info");
       } catch (err) {
+        const errStr = String(err);
+        if (/processing/i.test(errStr) && ctx.hasUI) {
+          const confirm = await ctx.ui.confirm(
+            "Wiki is Processing",
+            `Wiki "${cfg.captureWikiId}" is currently processing.\nDo you want to cancel the processing and retry upload?`,
+          );
+          if (confirm) {
+            try {
+              const newId = await cancelAndRecreateWiki(cfg, ctx.cwd);
+              await flushWikiArchiveSession(cfg, batch);
+              ctx.ui.notify(`Archived ${count} turn(s) to new wiki (${newId}).`, "info");
+              return;
+            } catch (reErr) {
+              pendingWikiMessages.unshift(...batch);
+              ctx.ui.notify(`Wiki sync failed — turns restored to buffer. ${reErr instanceof Error ? reErr.message : reErr}`, "error");
+              return;
+            }
+          }
+        }
         pendingWikiMessages.unshift(...batch);
         ctx.ui.notify(
           `Wiki sync failed — turns restored to buffer. ${err instanceof Error ? err.message : err}`,
@@ -1393,8 +1660,10 @@ Default endpoint: http://127.0.0.1:8420 (local MemoryCore gateway — no externa
         const agentId = await keep("agent_id", cfg.agentId);
         const userId = await keep("user_id", cfg.userId);
         const sessionId = await keep("session_id (used by writes)", cfg.sessionId);
-        const captureRaw = (await ctx.ui.input("Auto-capture every N turns (0 = off)", String(cfg.captureEveryNTurns))) ?? "";
+        const captureRaw = (await ctx.ui.input("Auto-capture chat memory every N turns (0 = off)", String(cfg.captureEveryNTurns))) ?? "";
         const captureEveryNTurns = /^\d+$/.test(captureRaw.trim()) ? Number(captureRaw.trim()) : cfg.captureEveryNTurns;
+        const captureWikiNRaw = (await ctx.ui.input("Auto-capture Wiki every N turns (0 = off)", String(cfg.captureWikiEveryNTurns))) ?? "";
+        const captureWikiEveryNTurns = /^\d+$/.test(captureWikiNRaw.trim()) ? Number(captureWikiNRaw.trim()) : cfg.captureWikiEveryNTurns;
         const captureWikiId = await keep("Wiki id to archive captured turns (empty = off)", cfg.captureWikiId);
         const captureWikiRef = await keep("Wiki page ref prefix for archive", cfg.captureWikiRef);
         const captureCodeGraphId = await keep("CodeGraph id to re-sync after capture (empty = off)", cfg.captureCodeGraphId);
@@ -1409,6 +1678,7 @@ Default endpoint: http://127.0.0.1:8420 (local MemoryCore gateway — no externa
           userId,
           sessionId,
           captureEveryNTurns,
+          captureWikiEveryNTurns,
           captureWikiId,
           captureWikiRef,
           captureCodeGraphId,
@@ -1438,11 +1708,17 @@ Default endpoint: http://127.0.0.1:8420 (local MemoryCore gateway — no externa
         const sessionId = await ask("session_id for THIS project", cfg.sessionId);
         const userId = await ask("user_id for THIS project", cfg.userId);
         const nRaw = (await ctx.ui.input(
-          "capture every N turns for THIS project (0 = off, Enter = system-wide)",
+          "capture chat memory every N turns for THIS project (0 = off, Enter = system-wide)",
           `current: ${cfg.captureEveryNTurns > 0 ? `every ${cfg.captureEveryNTurns} turns` : "off"}`,
         )) ?? "";
         const nTrim = nRaw.trim();
         const captureEveryNTurns: number | null = /^\d+$/.test(nTrim) ? Number(nTrim) : null;
+        const wnRaw = (await ctx.ui.input(
+          "capture Wiki every N turns for THIS project (0 = off, Enter = system-wide)",
+          `current: ${cfg.captureWikiEveryNTurns > 0 ? `every ${cfg.captureWikiEveryNTurns} turns` : "off"}`,
+        )) ?? "";
+        const wnTrim = wnRaw.trim();
+        const captureWikiEveryNTurns: number | null = /^\d+$/.test(wnTrim) ? Number(wnTrim) : null;
         const captureWikiId = await ask("wiki id to archive captures for THIS project (Enter = system-wide)", cfg.captureWikiId);
         const captureWikiRef = await ask("wiki archive page ref for THIS project (Enter = system-wide)", cfg.captureWikiRef);
         const captureCodeGraphId = await ask("codegraph id to re-sync for THIS project (Enter = system-wide)", cfg.captureCodeGraphId);
@@ -1452,13 +1728,14 @@ Default endpoint: http://127.0.0.1:8420 (local MemoryCore gateway — no externa
           sessionId: sessionId || null,
           userId: userId || null,
           captureEveryNTurns,
+          captureWikiEveryNTurns,
           captureWikiId: captureWikiId || null,
           captureWikiRef: captureWikiRef || null,
           captureCodeGraphId: captureCodeGraphId || null,
         };
         try {
           const filePath = saveProjectConfig(ctx.cwd, patch);
-          const summary = (["agentId", "sessionId", "userId", "captureEveryNTurns", "captureWikiId", "captureWikiRef", "captureCodeGraphId"] as const)
+          const summary = (["agentId", "sessionId", "userId", "captureEveryNTurns", "captureWikiEveryNTurns", "captureWikiId", "captureWikiRef", "captureCodeGraphId"] as const)
             .map((k) => `${k}: ${patch[k] === null || patch[k] === undefined ? "(system-wide)" : String(patch[k])}`)
             .join(", ");
           ctx.ui.notify(`Local config updated: ${summary}`, "info");
@@ -1479,7 +1756,7 @@ Default endpoint: http://127.0.0.1:8420 (local MemoryCore gateway — no externa
           `  api key     ${maskKey(cfg.apiKey)}`,
           `  service id  ${cfg.serviceId}`,
           `  team/agent/user/session  ${cfg.teamId} / ${cfg.agentId} / ${cfg.userId} / ${cfg.sessionId}`,
-          `  auto-capture  ${cfg.captureEveryNTurns > 0 ? `every ${cfg.captureEveryNTurns} turn(s)` : "off"}`,
+          `  auto-capture  chat: ${cfg.captureEveryNTurns > 0 ? `every ${cfg.captureEveryNTurns} turn(s)` : "off"} | wiki: ${cfg.captureWikiEveryNTurns > 0 ? `every ${cfg.captureEveryNTurns} turn(s)` : "off"}`,
           `  sync targets  wiki: ${cfg.captureWikiId || "(none)"}${cfg.captureWikiRef ? ` (ref: ${cfg.captureWikiRef})` : ""} | codegraph: ${cfg.captureCodeGraphId || "(none)"}`,
           `  knowledge    ${cfg.knowledgeEndpoint}`,
           `  project config     ${projectExists ? projectPath : "(none — using system-wide)"}`,
